@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shared async HTTP client (no base_url — IAM and SC have different domains)
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.sc_api_timeout),
+        verify=settings.hcs_verify_ssl,
     )
 
     yield

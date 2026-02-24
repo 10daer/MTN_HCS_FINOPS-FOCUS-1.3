@@ -81,3 +81,60 @@ class HCSMetricsResponse(BaseModel):
     end_time: str = Field(default="")
     total: int = Field(default=0)
     marker: str = Field(default="")
+
+
+# ── Regions ────────────────────────────────────────────────────────────
+
+
+class HCSRegion(BaseModel):
+    """
+    A single region entry from GET /silvan/rest/v1.0/regions.
+    """
+
+    seq_id: int = Field(default=0, alias="seqId")
+    id: str = Field(..., description="Region identifier (e.g. whdevp-env-5)")
+    name: str = Field(default="", description="Human-readable region name")
+    active: bool = Field(default=True)
+    domain_type: str = Field(default="", alias="domainType")
+    type: str = Field(default="")
+    global_id: str = Field(default="", alias="globalId")
+
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+
+class HCSRegionsResponse(BaseModel):
+    """
+    Envelope returned by GET /silvan/rest/v1.0/regions.
+    """
+
+    regions: list[HCSRegion] = Field(default_factory=list)
+    total: int = Field(default=0)
+
+
+# ── VDCs ───────────────────────────────────────────────────────────────
+
+
+class HCSVDC(BaseModel):
+    """
+    A single VDC entry from GET /rest/vdc/v3.0/vdcs.
+    """
+
+    id: str = Field(..., description="VDC ID")
+    name: str = Field(default="", description="VDC / tenant name")
+    domain_id: str = Field(default="", description="Tenant / project ID used in metrics queries")
+    domain_name: str = Field(default="", description="Tenant domain name")
+    level: int = Field(default=1, description="VDC hierarchy level (1 = top)")
+    upper_vdc_id: str = Field(default="0", description="Parent VDC ID")
+    upper_vdc_name: str | None = Field(default=None)
+    enabled: bool = Field(default=True)
+
+    model_config = {"extra": "allow"}
+
+
+class HCSVDCsResponse(BaseModel):
+    """
+    Envelope returned by GET /rest/vdc/v3.0/vdcs.
+    """
+
+    total: int = Field(default=0)
+    vdcs: list[HCSVDC] = Field(default_factory=list)

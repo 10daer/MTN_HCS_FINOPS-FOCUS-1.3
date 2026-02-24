@@ -20,11 +20,20 @@ from app.core.exceptions import (
     SourceAPITimeoutException,
 )
 from app.core.logging import get_logger
-from app.schemas import HCSMetricRecord, HCSMetricsResponse
+from app.schemas import (
+    HCSMetricRecord,
+    HCSMetricsResponse,
+    HCSRegion,
+    HCSRegionsResponse,
+    HCSVDC,
+    HCSVDCsResponse,
+)
 
 logger = get_logger(__name__)
 
 _METRICS_ENDPOINT = "/rest/metering/v3.0/query-metrics-data"
+_REGIONS_ENDPOINT = "/silvan/rest/v1.0/regions"
+_VDCS_ENDPOINT    = "/rest/vdc/v3.0/vdcs"
 
 
 class HCSClient:
@@ -106,6 +115,163 @@ class HCSClient:
         logger.info("HCS IAM authentication successful.")
         return token
 
+    # ── Regions ───────────────────────────────────────────────────────
+
+    async def fetch_regions(self) -> list[HCSRegion]:
+        """
+        Return all regions from the SC Northbound Interface.
+
+        GET https://{SC_DOMAIN}/silvan/rest/v1.0/regions
+
+        Returns:
+            List of HCSRegion objects (use .id as region_code).
+        """
+        if not self._token:
+            await self.authenticate()
+
+        assert self._token is not None
+
+        settings = get_settings()
+        url = f"{settings.sc_domain}{_REGIONS_ENDPOINT}"
+
+        logger.info("Fetching HCS regions", extra={"url": url})
+
+        try:
+            response = await self._client.get(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Auth-Token": self._token,
+                },
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise SourceAPITimeoutException(
+                details={"endpoint": url, "error": str(exc)}
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise SourceAPIConnectionException(
+                details={"endpoint": url, "error": str(exc)}
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                self._token = None
+            raise SourceAPIException(
+                message=f"SC API returned {exc.response.status_code} fetching regions.",
+                details={"endpoint": url, "body": exc.response.text[:500]},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise SourceAPIException(
+                message="Unexpected HTTP error fetching regions.",
+                details={"endpoint": url, "error": str(exc)},
+            ) from exc
+
+        try:
+            regions_response = HCSRegionsResponse(**response.json())
+        except Exception as exc:
+            raise SourceAPIException(
+                message="Failed to parse regions response.",
+                details={"endpoint": url, "error": str(exc)},
+            ) from exc
+
+        logger.info(
+            "HCS regions fetched",
+            extra={"region_count": len(regions_response.regions)},
+        )
+        return regions_response.regions
+
+    # ── VDCs ──────────────────────────────────────────────────────────
+
+    async def fetch_vdcs(
+        self,
+        level: int | None = None,
+        is_domain: str | None = None,
+        limit: int = 1000,
+    ) -> list[HCSVDC]:
+        """
+        Return VDCs (tenants) from the SC Northbound Interface, auto-paginating.
+
+        GET https://{SC_DOMAIN}/rest/vdc/v3.0/vdcs
+
+        Args:
+            level:     Filter by VDC level (1 = top-level tenants).
+            is_domain: "1" to return only tenants, "0" for sub-VDCs.
+            limit:     Page size (1-1000).
+
+        Returns:
+            List of HCSVDC objects (use .domain_id as the tenant ID for metrics).
+        """
+        if not self._token:
+            await self.authenticate()
+
+        assert self._token is not None
+
+        settings = get_settings()
+        base_url = f"{settings.sc_domain}{_VDCS_ENDPOINT}"
+
+        all_vdcs: list[HCSVDC] = []
+        start = 0
+
+        while True:
+            params: dict[str, Any] = {"start": start, "limit": limit}
+            if level is not None:
+                params["level"] = level
+            if is_domain is not None:
+                params["is_domain"] = is_domain
+
+            logger.info(
+                "Fetching HCS VDC page",
+                extra={"url": base_url, "start": start, "limit": limit},
+            )
+
+            try:
+                response = await self._client.get(
+                    base_url,
+                    params=params,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Auth-Token": self._token,
+                    },
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                raise SourceAPITimeoutException(
+                    details={"endpoint": base_url, "error": str(exc)}
+                ) from exc
+            except httpx.ConnectError as exc:
+                raise SourceAPIConnectionException(
+                    details={"endpoint": base_url, "error": str(exc)}
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    self._token = None
+                raise SourceAPIException(
+                    message=f"SC API returned {exc.response.status_code} fetching VDCs.",
+                    details={"endpoint": base_url, "body": exc.response.text[:500]},
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SourceAPIException(
+                    message="Unexpected HTTP error fetching VDCs.",
+                    details={"endpoint": base_url, "error": str(exc)},
+                ) from exc
+
+            try:
+                vdcs_response = HCSVDCsResponse(**response.json())
+            except Exception as exc:
+                raise SourceAPIException(
+                    message="Failed to parse VDC list response.",
+                    details={"endpoint": base_url, "error": str(exc)},
+                ) from exc
+
+            all_vdcs.extend(vdcs_response.vdcs)
+
+            if len(all_vdcs) >= vdcs_response.total or not vdcs_response.vdcs:
+                break
+            start += limit
+
+        logger.info("HCS VDCs fetched", extra={"vdc_count": len(all_vdcs)})
+        return all_vdcs
+
     # ── Metrics Query ─────────────────────────────────────────────────
 
     async def fetch_metrics(
@@ -147,74 +313,88 @@ class HCSClient:
         settings = get_settings()
         url = f"{settings.sc_domain}{_METRICS_ENDPOINT}"
 
-        body = {
-            "region_code": region_code,
-            "start_time": start_time,
-            "end_time": end_time,
-            "time_zone": time_zone,
-            "period": period,
-            "locale": locale,
-            "domain_id": domain_id,
-            "resource_type_code": resource_type_code,
-            "limit": limit,
-        }
+        all_records: list[HCSMetricRecord] = []
+        total_reported = 0
+        start = 0
 
-        logger.info(
-            "Fetching HCS metrics",
-            extra={"url": url, "region": region_code,
-                   "resource_type": resource_type_code},
-        )
+        while True:
+            body = {
+                "region_code": region_code,
+                "start_time": start_time,
+                "end_time": end_time,
+                "time_zone": time_zone,
+                "period": period,
+                "locale": locale,
+                "domain_id": domain_id,
+                "resource_type_code": resource_type_code,
+                "limit": limit,
+                "start": start,
+            }
 
-        try:
-            response = await self._client.post(
-                url,
-                json=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Auth-Token": self._token,
+            logger.info(
+                "Fetching HCS metrics page",
+                extra={
+                    "url": url,
+                    "region": region_code,
+                    "resource_type": resource_type_code,
+                    "start": start,
+                    "limit": limit,
                 },
             )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise SourceAPITimeoutException(
-                details={"endpoint": url, "error": str(exc)}
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise SourceAPIConnectionException(
-                details={"endpoint": url, "error": str(exc)}
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            # If 401, token may have expired — clear it for retry
-            if exc.response.status_code == 401:
-                self._token = None
-            raise SourceAPIException(
-                message=f"SC API returned {exc.response.status_code}.",
-                details={
-                    "endpoint": url,
-                    "status_code": exc.response.status_code,
-                    "body": exc.response.text[:500],
-                },
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise SourceAPIException(
-                message="Unexpected HTTP error from SC API.",
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
 
-        try:
-            payload = response.json()
-            metrics_response = HCSMetricsResponse(**payload)
-        except Exception as exc:
-            raise SourceAPIException(
-                message="Failed to parse SC API metrics response.",
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
+            try:
+                response = await self._client.post(
+                    url,
+                    json=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Auth-Token": self._token,
+                    },
+                )
+                response.raise_for_status()
+            except httpx.TimeoutException as exc:
+                raise SourceAPITimeoutException(
+                    details={"endpoint": url, "error": str(exc)}
+                ) from exc
+            except httpx.ConnectError as exc:
+                raise SourceAPIConnectionException(
+                    details={"endpoint": url, "error": str(exc)}
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                # If 401, token may have expired — clear it for retry
+                if exc.response.status_code == 401:
+                    self._token = None
+                raise SourceAPIException(
+                    message=f"SC API returned {exc.response.status_code}.",
+                    details={
+                        "endpoint": url,
+                        "status_code": exc.response.status_code,
+                        "body": exc.response.text[:500],
+                    },
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SourceAPIException(
+                    message="Unexpected HTTP error from SC API.",
+                    details={"endpoint": url, "error": str(exc)},
+                ) from exc
+
+            try:
+                metrics_response = HCSMetricsResponse(**response.json())
+            except Exception as exc:
+                raise SourceAPIException(
+                    message="Failed to parse SC API metrics response.",
+                    details={"endpoint": url, "error": str(exc)},
+                ) from exc
+
+            all_records.extend(metrics_response.metrics)
+            total_reported = metrics_response.total
+
+            if len(all_records) >= total_reported or not metrics_response.metrics:
+                break
+            start += limit
 
         logger.info(
             "HCS metrics fetch complete",
-            extra={
-                "record_count": len(metrics_response.metrics),
-                "total": metrics_response.total,
-            },
+            extra={"record_count": len(all_records), "total": total_reported},
         )
-        return metrics_response.metrics
+        return all_records

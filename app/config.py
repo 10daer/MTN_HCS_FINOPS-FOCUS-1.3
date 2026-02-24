@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     # ── HCS ManageOne — SC Northbound Interface ───────────────────────
     sc_domain: str = "https://sc.example.huaweicloud.com"
     sc_api_timeout: int = 30
+    hcs_verify_ssl: bool = False  # Set to True in production with valid certs
 
     # ── Logging ───────────────────────────────────────────────────────
     log_level: str = "INFO"
