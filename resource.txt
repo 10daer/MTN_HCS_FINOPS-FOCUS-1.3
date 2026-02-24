@@ -1,0 +1,282 @@
+### Step-by-Step Process for Querying Resource Dimension Measurement Data in ManageOne (HCS Environment)
+
+Based on the provided documentation text for ManageOne version 8.3.0 and above, this process focuses on querying cloud service call detail records (CDRs) via APIs to obtain resource billing and usage data. This is an online API-based approach, though the doc mentions offline CDR files (compressed hourly and uploaded to a CDR server) as crucial for billing systems. The APIs involved are for authentication (Get Token), region listing, VDC (Virtual Data Center) listing, and querying metrics data.
+
+**Note:** This applies to Huawei Cloud Stack (HCS) environments managed by ManageOne. You need an operations administrator account (domain: mo_bss_admin). Ensure network connectivity to the IAM and SC Northbound Interface domains. For full API details, refer to "ManageOne 8.X Operations API Reference.docx" as mentioned. Data is periodic (e.g., hourly/daily/monthly), with retention limits (e.g., 10 days for hourly data). Examples use placeholder values like dates in 2025; adjust to your actual timestamps.
+
+#### Prerequisites
+1. Obtain the operations administrator account username and password (e.g., domain: mo_bss_admin).
+2. Get the IP address/domain names for:
+   - IAM external access domain (for token).
+   - SC Northbound Interface Domain (for regions, VDCs, and metrics queries).
+   - Ensure network connectivity; refer to the linked forum thread for setup: https://bbs.huaweicloud.com/forum/thread-41849-1-1.html.
+3. Have tools ready for API calls (e.g., cURL, Postman, or scripting languages like Python with requests library).
+4. Know the resource types you want to query (e.g., "hws.resource.type.volume" for cloud disks; see appendix in the doc for supported metered resources).
+5. Understand query limits: Paginated results (start/limit parameters), time intervals (e.g., max 1 week for hourly), and retention (e.g., recent 1000 days for daily).
+
+#### Step 1: Obtain Administrator Token
+- **Purpose:** Authenticate as the operations admin to get a token for subsequent API calls.
+- **URL:** `https://{IAM external access domain}/v3/auth/tokens`
+- **Method:** POST
+- **Headers:**
+  - `Accept: application/json`
+  - `Content-Type: application/json;charset=UTF-8`
+- **Request Body:** (Use the fixed domain "mo_bss_admin" for operations admin; replace "XXXX" with actual username/password.)
+  ```
+  {
+    "auth": {
+      "identity": {
+        "methods": [
+          "password"
+        ],
+        "password": {
+          "user": {
+            "domain": {
+              "name": "mo_bss_admin"
+            },
+            "name": "XXXX",
+            "password": "XXXXXX"
+          }
+        }
+      },
+      "scope": {
+        "domain": {
+          "name": "mo_bss_admin"
+        }
+      }
+    }
+  }
+  ```
+- **Response:** HTTP 201 Created. Extract the token from the `X-Subject-Token` header in the response (e.g., "x-xxxxxxxxxxx").
+- **Example cURL Command:**
+  ```
+  curl -X POST https://{IAM external access domain}/v3/auth/tokens \
+  -H "Accept: application/json" \
+  -H "Content-Type: application/json;charset=UTF-8" \
+  -d '{
+    "auth": {
+      "identity": {
+        "methods": ["password"],
+        "password": {
+          "user": {
+            "domain": {"name": "mo_bss_admin"},
+            "name": "XXXX",
+            "password": "XXXXXX"
+          }
+        }
+      },
+      "scope": {
+        "domain": {"name": "mo_bss_admin"}
+      }
+    }
+  }'
+  ```
+- **Troubleshooting:** If using VDC admin, replace domain with tenant name. Token is in response headers.
+
+#### Step 2: Query the List of Regions
+- **Purpose:** Get region IDs (e.g., "whdevp-env-5") needed for metrics queries.
+- **URL:** `GET https://{SC Northbound Interface Domain}/silvan/rest/v1.0/regions`
+- **Headers:**
+  - `Content-Type: application/json`
+  - `X-Auth-Token: {token from Step 1}`
+- **Request Body:** None.
+- **Response Example:**
+  ```
+  {
+    "regions": [
+      {
+        "seqId": 1,
+        "id": "whdevp-env-5",
+        "name": "维护开发环境5",
+        "created": "2024-06-18 21:11:36.0",
+        "lastModified": "2025-04-13 14:46:49.0",
+        "locale": "zh-cn",
+        "active": true,
+        "domainType": "SC",
+        "type": "private",
+        "deployType": null,
+        "authUrl": null,
+        "iamId": null,
+        "globalId": "whdevp-env-5"
+      }
+    ],
+    "total": 1
+  }
+  ```
+- Extract the `id` field (e.g., "whdevp-env-5") as the region_code for later steps.
+- **Example cURL Command:**
+  ```
+  curl -X GET https://{SC Northbound Interface Domain}/silvan/rest/v1.0/regions \
+  -H "Content-Type: application/json" \
+  -H "X-Auth-Token: x-xxxxxxxxxxx"
+  ```
+
+#### Step 3: Query the VDC List
+- **Purpose:** Get tenant IDs (domain_id) for specific VDCs/tenants whose resources you want to query.
+- **URL:** `GET https://{SC Northbound Interface Domain}/rest/vdc/v3.0/vdcs?start=0&limit=1000`
+  - Parameters: `start` (pagination offset, default 0), `limit` (items per page, 1-1000, default 20).
+  - Optional query params (e.g., &name={VDC name}, &upper_vdc_id={ID}, &domain_id={ID}, &level={1-5}, &sort_key={create_at or name}, &sort_dir={asc or desc}, &is_domain={0 or 1}, &query_name={domainName, upperVdcName, or extra}, &query_value={value}). See API reference for full list.
+- **Headers:**
+  - `Content-Type: application/json`
+  - `X-Auth-Token: {token from Step 1}`
+- **Request Body:** None.
+- **Response Example:**
+  ```
+  {
+    "total": 1,
+    "vdcs": [
+      {
+        "id": "eba900c3-1386-422e-a68d-da4f1f0aef18",
+        "name": "yiwa",
+        "tag": "vdc",
+        "description": null,
+        "upper_vdc_id": "0",
+        "upper_vdc_name": null,
+        "top_vdc_id": "eba900c3-1386-422e-a68d-da4f1f0aef18",
+        "extra": "{\"manager\":\"\",\"phone\":\"\",\"email\":\"\"}",
+        "ecs_used": 0.0,
+        "evs_used": 0.0,
+        "project_count": 6,
+        "enabled": true,
+        "domain_id": "293e0d295e0f4110abf1697da9c68787",
+        "level": 1,
+        "create_user_id": "a3c77832e5cb4a4593acb340ab627dc7",
+        "create_user_name": "bss_admin",
+        "create_at": 1719453859000,
+        "utc_create_at": "2024-06-27 02:04:19.0",
+        "domain_name": "yiwa",
+        "ldap_id": null,
+        "third_id": null,
+        "idp_name": null,
+        "third_type": "0",
+        "region_id": null,
+        "enterprise_id": null,
+        "az_id": null,
+        "enterprise_project_id": null
+      }
+    ]
+  }
+  ```
+- Extract the `domain_id` (e.g., "293e0d295e0f4110abf1697da9c68787") as the tenant ID for metrics queries.
+- **Example cURL Command:**
+  ```
+  curl -X GET "https://{SC Northbound Interface Domain}/rest/vdc/v3.0/vdcs?start=0&limit=1000" \
+  -H "Content-Type: application/json" \
+  -H "X-Auth-Token: x-xxxxxxxxxxx"
+  ```
+- If paginated, increment `start` by `limit` for next pages until `total` is covered.
+
+#### Step 4: Query Cloud Service Call Detail Records (Metrics Data)
+- **Purpose:** Retrieve resource usage/billing data for the specified tenant, region, time period, and resource type.
+- **URL:** `POST https://{SC Northbound Interface Domain}/rest/metering/v3.0/query-metrics-data`
+  - Pagination via request body (limit), but doc mentions start/limit similar to VDC query.
+- **Headers:**
+  - `Content-Type: application/json`
+  - `X-Auth-Token: {token from Step 1}`
+- **Request Body Example:** (Adjust parameters as needed.)
+  ```
+  {
+    "region_code": "whdevp-env-5",
+    "start_time": "2025-04-01 00:00:00",
+    "end_time": "2025-04-04 23:59:59",
+    "time_zone": "Asia/Shanghai",
+    "period": "daily",
+    "locale": "zh_CN",
+    "domain_id": "293e0d295e0f4110abf1697da9c68787",
+    "resource_type_code": "hws.resource.type.volume",
+    "limit": 1000
+  }
+  ```
+  - **Key Parameters:**
+    - `region_code`: From Step 2 (required).
+    - `start_time` / `end_time`: Time range (required; format: YYYY-MM-DD HH:MM:SS).
+    - `period`: "hourly" (max 1 week, recent 10 days), "daily" (max 1 month, recent 1000 days), "monthly" (max 1 year).
+    - `time_zone`: e.g., "Asia/Shanghai" for China.
+    - `locale`: "zh_CN" (Chinese) or "en_US" (English; default).
+    - `domain_id`: Tenant ID from Step 3.
+    - `resource_type_code`: e.g., "hws.resource.type.volume" for volumes (see appendix for others).
+    - `limit`: Items per page (1-1000).
+    - Additional query conditions: Refer to API reference for full list.
+- **Response Example:** (Array of metrics with usage details.)
+  ```
+  {
+    "metrics": [
+      {
+        "id": "c9e7dd89-70b1-46a0-8851-f519c07610c4",
+        "record_type": "20",
+        "user_id": "2e1ffdb5060b493d94583ff4bfa8f3b6",
+        "region_code": "whdevp-env-5",
+        "cloud_infra_id": "",
+        "az_code": "az5.dc5",
+        "cloud_service_type_code": "hws.service.type.evs",
+        "resource_type_code": "hws.resource.type.volume",
+        "resource_spec_code": "IPSAN",
+        "resource_id": "4dcfaecc-ec31-424f-9811-32f33c811ce1",
+        "resource_display_name": "xp02-volume-0000",
+        "bss_params": "::xp02-volume-0000",
+        "start_time": "2025-04-01 00:00:00",
+        "end_time": "2025-04-02 00:00:00",
+        "tag": "",
+        "upper_vdc_id": "eba900c3-1386-422e-a68d-da4f1f0aef18",
+        "vdc_id": "eba900c3-1386-422e-a68d-da4f1f0aef18",
+        "enterprise_project_id": "0",
+        "meter_unit_id": "-1",
+        "meter_unit_name": "",
+        "extend_params": "",
+        "meter_ways": "hour",
+        "spec_define_name": "IPSAN(业务卷5)",
+        "price": "4",
+        "usage_duration": 86400,
+        "accumulate_mode": "DURATION",
+        "spec_define_id": "7423ab31-aed9-4805-880f-def7e2c4aa11",
+        "price_unit": "GB",
+        "usage_value": 8
+      },
+      // Additional entries...
+    ],
+    "time_zone": "Asia/Shanghai",
+    "start_time": "2025-04-01 00:00:00",
+    "end_time": "2025-04-04 00:00:00",
+    "total": 117,
+    "marker": ""
+  }
+  ```
+- **Key Response Fields:**
+  - `user_id`: Project/resource ID.
+  - `region_code` / `az_code`: Location details.
+  - `cloud_service_type_code` / `resource_type_code` / `resource_spec_code`: Resource identifiers.
+  - `resource_id` / `resource_display_name`: Specific resource details.
+  - `start_time` / `end_time`: Time period.
+  - `accumulate_mode`: "DURATION" (time-based, e.g., seconds) or "USAGE" (count-based, e.g., messages).
+  - `usage_value`: Cumulative usage (rounded to 6 decimals).
+  - `usage_duration`: Duration in seconds.
+  - `price` / `price_unit`: Cost details.
+  - `spec_define_name`: Billing item name.
+  - `vdc_id` / `upper_vdc_id`: VDC hierarchy.
+- **Example cURL Command:**
+  ```
+  curl -X POST https://{SC Northbound Interface Domain}/rest/metering/v3.0/query-metrics-data \
+  -H "Content-Type: application/json" \
+  -H "X-Auth-Token: x-xxxxxxxxxxx" \
+  -d '{
+    "region_code": "whdevp-env-5",
+    "start_time": "2025-04-01 00:00:00",
+    "end_time": "2025-04-04 23:59:59",
+    "time_zone": "Asia/Shanghai",
+    "period": "daily",
+    "locale": "zh_CN",
+    "domain_id": "293e0d295e0f4110abf1697da9c68787",
+    "resource_type_code": "hws.resource.type.volume",
+    "limit": 1000
+  }'
+  ```
+- **Pagination:** If `total` > limit, use the `marker` or adjust start/limit in subsequent calls (refer to API doc for exact handling).
+- **Troubleshooting:** Queries fail if outside retention periods. For offline CDRs, access the CDR server separately (not detailed here).
+
+#### Additional Notes
+- **Offline CDR Files:** If needed, these are compressed (.zip or similar) hourly and include CDR data + signature files. Access via CDR server (not API-detailed here).
+- **Error Handling:** Check HTTP status (e.g., 401 for invalid token). Renew token if expired.
+- **Customization:** For other resources, change `resource_type_code`. Aggregate data programmatically (e.g., sum usage_value for total billing).
+- **Security:** Use HTTPS; handle tokens securely.
+
+If you need scripting examples (e.g., Python) or clarification on the API reference doc, provide more details!
