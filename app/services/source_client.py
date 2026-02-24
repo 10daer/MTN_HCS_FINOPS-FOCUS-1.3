@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 
 _METRICS_ENDPOINT = "/rest/metering/v3.0/query-metrics-data"
 _REGIONS_ENDPOINT = "/silvan/rest/v1.0/regions"
-_VDCS_ENDPOINT    = "/rest/vdc/v3.0/vdcs"
+_VDCS_ENDPOINT = "/rest/vdc/v3.0/vdcs"
 
 
 class HCSClient:
@@ -247,7 +247,8 @@ class HCSClient:
                     self._token = None
                 raise SourceAPIException(
                     message=f"SC API returned {exc.response.status_code} fetching VDCs.",
-                    details={"endpoint": base_url, "body": exc.response.text[:500]},
+                    details={"endpoint": base_url,
+                             "body": exc.response.text[:500]},
                 ) from exc
             except httpx.HTTPError as exc:
                 raise SourceAPIException(

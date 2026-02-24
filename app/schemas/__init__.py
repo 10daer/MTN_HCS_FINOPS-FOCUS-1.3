@@ -121,7 +121,8 @@ class HCSVDC(BaseModel):
 
     id: str = Field(..., description="VDC ID")
     name: str = Field(default="", description="VDC / tenant name")
-    domain_id: str = Field(default="", description="Tenant / project ID used in metrics queries")
+    domain_id: str = Field(
+        default="", description="Tenant / project ID used in metrics queries")
     domain_name: str = Field(default="", description="Tenant domain name")
     level: int = Field(default=1, description="VDC hierarchy level (1 = top)")
     upper_vdc_id: str = Field(default="0", description="Parent VDC ID")
