@@ -111,12 +111,25 @@ def _run_curl(
 
     output = result.stdout
 
-    # Split header block from body (curl --dump-header - separates with \r\n\r\n)
-    header_block, _, body_text = output.partition("\r\n\r\n")
-    if not body_text:
-        header_block, _, body_text = output.partition("\n\n")
+    # curl --dump-header - may include multiple HTTP response blocks when the
+    # server sends 100 Continue, 301/302 redirects, etc.  Always use the LAST
+    # complete block so we parse the final status + body, not an intermediate one.
+    #
+    # Strategy: find the last occurrence of a line that starts "HTTP/" and take
+    # everything from there as the final response block.
+    last_http_pos = max(output.rfind("\r\nHTTP/"), output.rfind("\nHTTP/"))
+    if last_http_pos != -1:
+        # Skip the leading newline character(s)
+        final_block = output[last_http_pos:].lstrip("\r\n")
+    else:
+        final_block = output
 
-    # Parse status code from first header line  e.g. "HTTP/1.1 201 Created"
+    # Split the final block into header section and body
+    header_block, sep, body_text = final_block.partition("\r\n\r\n")
+    if not sep:
+        header_block, sep, body_text = final_block.partition("\n\n")
+
+    # Parse status code from the status line, e.g. "HTTP/1.1 201 Created"
     status_code = 0
     parsed_headers: dict[str, str] = {}
     for line in header_block.splitlines():
@@ -432,12 +445,24 @@ class HCSClient:
                     },
                 )
 
+            # A 200 with an empty body means no records for this query
+            if not response.text:
+                logger.warning(
+                    "SC API returned 200 with empty body — treating as zero records",
+                    extra={"endpoint": url, "start": start},
+                )
+                break
+
             try:
                 metrics_response = HCSMetricsResponse(**response.json())
             except Exception as exc:
                 raise SourceAPIException(
                     message="Failed to parse SC API metrics response.",
-                    details={"endpoint": url, "error": str(exc)},
+                    details={
+                        "endpoint": url,
+                        "error": str(exc),
+                        "raw_body": response.text[:500],
+                    },
                 ) from exc
 
             all_records.extend(metrics_response.metrics)
