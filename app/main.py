@@ -5,7 +5,6 @@ FastAPI application factory.
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
-import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -36,16 +35,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         },
     )
 
-    # Shared async HTTP client (no base_url — IAM and SC have different domains)
-    app.state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.sc_api_timeout),
-        verify=settings.hcs_verify_ssl,
-    )
-
     yield
 
     # Shutdown
-    await app.state.http_client.aclose()
     logger.info("Application shut down gracefully.")
 
 

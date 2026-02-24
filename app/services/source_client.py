@@ -5,13 +5,17 @@ Handles:
   1. Authentication via IAM (token acquisition).
   2. Querying metering/metrics data from SC API.
 
-Wraps httpx with proper error handling mapped to our exception hierarchy.
+Uses curl (via subprocess) for all HTTP calls so system/VPN routing and
+SSL bypass are inherited automatically — identical to running curl directly.
+asyncio.to_thread() keeps the event loop unblocked.
 """
 
+import asyncio
+import json
+import subprocess
 from datetime import datetime, timezone, timedelta
 from typing import Any
-
-import httpx
+from urllib.parse import urlencode
 
 from app.config import get_settings
 from app.core.exceptions import (
@@ -37,14 +41,111 @@ _REGIONS_ENDPOINT = "/silvan/rest/v1.0/regions"
 _VDCS_ENDPOINT = "/rest/vdc/v3.0/vdcs"
 
 
+# ── curl response container ───────────────────────────────────────────
+
+class _CurlResponse:
+    __slots__ = ("status_code", "headers", "text")
+
+    def __init__(self, status_code: int, headers: dict[str, str], text: str) -> None:
+        self.status_code = status_code
+        self.headers = headers
+        self.text = text
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+# ── low-level curl helper ─────────────────────────────────────────────
+
+def _run_curl(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: dict | None = None,
+    timeout: int = 30,
+) -> _CurlResponse:
+    """
+    Execute a single curl request and return a _CurlResponse.
+    Runs synchronously — call via asyncio.to_thread() from async code.
+
+    Raises:
+        SourceAPITimeoutException:    curl exit code 28 (operation timed out).
+        SourceAPIConnectionException: curl exit code 7 (failed to connect).
+        SourceAPIException:           any other non-zero curl exit code.
+    """
+    cmd = [
+        "curl",
+        "--insecure",          # disable SSL cert validation (internal certs)
+        "--silent",
+        "--show-error",
+        "--max-time", str(timeout),
+        "--request", method.upper(),
+        "--url", url,
+        "--dump-header", "-",  # write response headers to stdout before body
+    ]
+
+    for key, value in (headers or {}).items():
+        cmd += ["--header", f"{key}: {value}"]
+
+    if body is not None:
+        cmd += ["--header", "Content-Type: application/json",
+                "--data", json.dumps(body)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if result.returncode == 28:
+            raise SourceAPITimeoutException(
+                message=f"Request to {url} timed out after {timeout}s.",
+                details={"endpoint": url, "error": stderr},
+            )
+        if result.returncode == 7:
+            raise SourceAPIConnectionException(
+                details={"endpoint": url, "error": stderr},
+            )
+        raise SourceAPIException(
+            message=f"curl exited with code {result.returncode}.",
+            details={"endpoint": url, "error": stderr},
+        )
+
+    output = result.stdout
+
+    # Split header block from body (curl --dump-header - separates with \r\n\r\n)
+    header_block, _, body_text = output.partition("\r\n\r\n")
+    if not body_text:
+        header_block, _, body_text = output.partition("\n\n")
+
+    # Parse status code from first header line  e.g. "HTTP/1.1 201 Created"
+    status_code = 0
+    parsed_headers: dict[str, str] = {}
+    for line in header_block.splitlines():
+        line = line.strip()
+        if line.upper().startswith("HTTP/"):
+            try:
+                status_code = int(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif ": " in line:
+            k, _, v = line.partition(": ")
+            parsed_headers[k.lower()] = v
+
+    return _CurlResponse(
+        status_code=status_code,
+        headers=parsed_headers,
+        text=body_text.strip(),
+    )
+
+
+# ── HCS client ────────────────────────────────────────────────────────
+
 class HCSClient:
-    """Async HTTP client for Huawei Cloud Stack ManageOne APIs."""
+    """curl-backed client for Huawei Cloud Stack ManageOne APIs."""
 
     # Refresh 60 s before actual expiry to avoid races
     _TOKEN_EXPIRY_BUFFER = timedelta(seconds=60)
 
-    def __init__(self, http_client: httpx.AsyncClient) -> None:
-        self._client = http_client
+    def __init__(self) -> None:
         self._token: str | None = None
         self._token_expires_at: datetime | None = None
 
@@ -56,6 +157,10 @@ class HCSClient:
             self._token_expires_at - self._TOKEN_EXPIRY_BUFFER
         )
 
+    def _invalidate_token(self) -> None:
+        self._token = None
+        self._token_expires_at = None
+
     # ── Authentication ────────────────────────────────────────────────
 
     async def authenticate(self) -> str:
@@ -63,12 +168,6 @@ class HCSClient:
         Obtain an admin token from the IAM endpoint.
 
         POST https://{IAM_DOMAIN}/v3/auth/tokens
-
-        Returns:
-            The X-Subject-Token value.
-
-        Raises:
-            AuthenticationException: On auth failure.
         """
         settings = get_settings()
         url = f"{settings.iam_domain}/v3/auth/tokens"
@@ -85,59 +184,38 @@ class HCSClient:
                         }
                     },
                 },
-                "scope": {
-                    "domain": {"name": settings.iam_auth_domain}
-                },
+                "scope": {"domain": {"name": settings.iam_auth_domain}},
             }
         }
 
         logger.info("Authenticating with HCS IAM", extra={"url": url})
 
-        try:
-            response = await self._client.post(
-                url,
-                json=body,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json;charset=UTF-8",
-                },
+        response = await asyncio.to_thread(
+            _run_curl, "POST", url,
+            headers={"Accept": "application/json"},
+            body=body,
+            timeout=settings.sc_api_timeout,
+        )
+
+        status = response.status_code
+        if status in (401, 403):
+            raise AuthenticationException(
+                message=f"IAM authentication rejected (HTTP {status}).",
+                details={"url": url, "body": response.text[:500]},
             )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
+        if status == 504:
             raise SourceAPITimeoutException(
-                message="IAM authentication request timed out.",
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise SourceAPIConnectionException(
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            body = exc.response.text[:500]
-            # 4xx credential/auth errors → AuthenticationException (401 to client)
-            if status in (401, 403):
-                raise AuthenticationException(
-                    message=f"IAM authentication rejected (HTTP {status}).",
-                    details={"url": url, "body": body},
-                ) from exc
-            # 504 / upstream gateway timeout → SourceAPITimeoutException
-            if status == 504:
-                raise SourceAPITimeoutException(
-                    message="IAM gateway timed out (504). Check network path to IAM.",
-                    details={"url": url, "body": body},
-                ) from exc
-            # Any other non-2xx (5xx, etc.) → SourceAPIException (502 to client)
+                message="IAM gateway timed out (504). Check network path to IAM.",
+                details={"url": url, "body": response.text[:500]},
+            )
+        if status not in (200, 201):
             raise SourceAPIException(
                 message=f"IAM endpoint returned HTTP {status}.",
-                details={"url": url, "status_code": status, "body": body},
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise SourceAPIConnectionException(
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
+                details={"url": url, "status_code": status,
+                         "body": response.text[:500]},
+            )
 
-        token = response.headers.get("X-Subject-Token", "")
+        token = response.headers.get("x-subject-token", "")
         if not token:
             raise AuthenticationException(
                 message="IAM response missing X-Subject-Token header.",
@@ -147,8 +225,7 @@ class HCSClient:
 
         # Parse expiry and user info from the response body
         try:
-            body_data = response.json()
-            token_data = body_data.get("token", {})
+            token_data = response.json().get("token", {})
             expires_at_str = token_data.get("expires_at", "")
             if expires_at_str:
                 self._token_expires_at = datetime.fromisoformat(
@@ -164,7 +241,6 @@ class HCSClient:
                 },
             )
         except Exception:
-            # Non-fatal — token itself is valid even if body parsing fails
             logger.warning("Could not parse IAM token response body.")
 
         return token
@@ -176,9 +252,6 @@ class HCSClient:
         Return all regions from the SC Northbound Interface.
 
         GET https://{SC_DOMAIN}/silvan/rest/v1.0/regions
-
-        Returns:
-            List of HCSRegion objects (use .id as region_code).
         """
         if not self._is_token_valid():
             await self.authenticate()
@@ -190,36 +263,19 @@ class HCSClient:
 
         logger.info("Fetching HCS regions", extra={"url": url})
 
-        try:
-            response = await self._client.get(
-                url,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Auth-Token": self._token,
-                },
+        response = await asyncio.to_thread(
+            _run_curl, "GET", url,
+            headers={"X-Auth-Token": self._token},
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401:
+            self._invalidate_token()
+        if response.status_code != 200:
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} fetching regions.",
+                details={"endpoint": url, "body": response.text[:500]},
             )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise SourceAPITimeoutException(
-                details={"endpoint": url, "error": str(exc)}
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise SourceAPIConnectionException(
-                details={"endpoint": url, "error": str(exc)}
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 401:
-                self._token = None
-                self._token_expires_at = None
-            raise SourceAPIException(
-                message=f"SC API returned {exc.response.status_code} fetching regions.",
-                details={"endpoint": url, "body": exc.response.text[:500]},
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise SourceAPIException(
-                message="Unexpected HTTP error fetching regions.",
-                details={"endpoint": url, "error": str(exc)},
-            ) from exc
 
         try:
             regions_response = HCSRegionsResponse(**response.json())
@@ -229,10 +285,8 @@ class HCSClient:
                 details={"endpoint": url, "error": str(exc)},
             ) from exc
 
-        logger.info(
-            "HCS regions fetched",
-            extra={"region_count": len(regions_response.regions)},
-        )
+        logger.info("HCS regions fetched",
+                    extra={"region_count": len(regions_response.regions)})
         return regions_response.regions
 
     # ── VDCs ──────────────────────────────────────────────────────────
@@ -247,14 +301,6 @@ class HCSClient:
         Return VDCs (tenants) from the SC Northbound Interface, auto-paginating.
 
         GET https://{SC_DOMAIN}/rest/vdc/v3.0/vdcs
-
-        Args:
-            level:     Filter by VDC level (1 = top-level tenants).
-            is_domain: "1" to return only tenants, "0" for sub-VDCs.
-            limit:     Page size (1-1000).
-
-        Returns:
-            List of HCSVDC objects (use .domain_id as the tenant ID for metrics).
         """
         if not self._is_token_valid():
             await self.authenticate()
@@ -274,43 +320,25 @@ class HCSClient:
             if is_domain is not None:
                 params["is_domain"] = is_domain
 
-            logger.info(
-                "Fetching HCS VDC page",
-                extra={"url": base_url, "start": start, "limit": limit},
+            url = f"{base_url}?{urlencode(params)}"
+
+            logger.info("Fetching HCS VDC page",
+                        extra={"url": base_url, "start": start, "limit": limit})
+
+            response = await asyncio.to_thread(
+                _run_curl, "GET", url,
+                headers={"X-Auth-Token": self._token},
+                timeout=settings.sc_api_timeout,
             )
 
-            try:
-                response = await self._client.get(
-                    base_url,
-                    params=params,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Auth-Token": self._token,
-                    },
-                )
-                response.raise_for_status()
-            except httpx.TimeoutException as exc:
-                raise SourceAPITimeoutException(
-                    details={"endpoint": base_url, "error": str(exc)}
-                ) from exc
-            except httpx.ConnectError as exc:
-                raise SourceAPIConnectionException(
-                    details={"endpoint": base_url, "error": str(exc)}
-                ) from exc
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 401:
-                    self._token = None
-                    self._token_expires_at = None
+            if response.status_code == 401:
+                self._invalidate_token()
+            if response.status_code != 200:
                 raise SourceAPIException(
-                    message=f"SC API returned {exc.response.status_code} fetching VDCs.",
+                    message=f"SC API returned {response.status_code} fetching VDCs.",
                     details={"endpoint": base_url,
-                             "body": exc.response.text[:500]},
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise SourceAPIException(
-                    message="Unexpected HTTP error fetching VDCs.",
-                    details={"endpoint": base_url, "error": str(exc)},
-                ) from exc
+                             "body": response.text[:500]},
+                )
 
             try:
                 vdcs_response = HCSVDCsResponse(**response.json())
@@ -344,23 +372,9 @@ class HCSClient:
         limit: int = 1000,
     ) -> list[HCSMetricRecord]:
         """
-        Query cloud service CDRs from the SC Northbound Interface.
+        Query cloud service CDRs from the SC Northbound Interface, auto-paginating.
 
         POST https://{SC_DOMAIN}/rest/metering/v3.0/query-metrics-data
-
-        Args:
-            region_code:        Region ID (from /silvan/rest/v1.0/regions).
-            domain_id:          Tenant/VDC domain ID.
-            start_time:         Start of period (YYYY-MM-DD HH:MM:SS).
-            end_time:           End of period (YYYY-MM-DD HH:MM:SS).
-            resource_type_code: e.g. "hws.resource.type.volume".
-            period:             "hourly", "daily", or "monthly".
-            time_zone:          Timezone string.
-            locale:             "en_US" or "zh_CN".
-            limit:              Page size (1-1000).
-
-        Returns:
-            List of validated HCSMetricRecord objects.
         """
         if not self._is_token_valid():
             await self.authenticate()
@@ -399,42 +413,24 @@ class HCSClient:
                 },
             )
 
-            try:
-                response = await self._client.post(
-                    url,
-                    json=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Auth-Token": self._token,
-                    },
-                )
-                response.raise_for_status()
-            except httpx.TimeoutException as exc:
-                raise SourceAPITimeoutException(
-                    details={"endpoint": url, "error": str(exc)}
-                ) from exc
-            except httpx.ConnectError as exc:
-                raise SourceAPIConnectionException(
-                    details={"endpoint": url, "error": str(exc)}
-                ) from exc
-            except httpx.HTTPStatusError as exc:
-                # If 401, token may have expired — clear it for retry
-                if exc.response.status_code == 401:
-                    self._token = None
-                    self._token_expires_at = None
+            response = await asyncio.to_thread(
+                _run_curl, "POST", url,
+                headers={"X-Auth-Token": self._token},
+                body=body,
+                timeout=settings.sc_api_timeout,
+            )
+
+            if response.status_code == 401:
+                self._invalidate_token()
+            if response.status_code != 200:
                 raise SourceAPIException(
-                    message=f"SC API returned {exc.response.status_code}.",
+                    message=f"SC API returned {response.status_code}.",
                     details={
                         "endpoint": url,
-                        "status_code": exc.response.status_code,
-                        "body": exc.response.text[:500],
+                        "status_code": response.status_code,
+                        "body": response.text[:500],
                     },
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise SourceAPIException(
-                    message="Unexpected HTTP error from SC API.",
-                    details={"endpoint": url, "error": str(exc)},
-                ) from exc
+                )
 
             try:
                 metrics_response = HCSMetricsResponse(**response.json())
