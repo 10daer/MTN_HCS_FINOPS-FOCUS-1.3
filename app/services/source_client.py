@@ -8,6 +8,7 @@ Handles:
 Wraps httpx with proper error handling mapped to our exception hierarchy.
 """
 
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
@@ -39,9 +40,21 @@ _VDCS_ENDPOINT = "/rest/vdc/v3.0/vdcs"
 class HCSClient:
     """Async HTTP client for Huawei Cloud Stack ManageOne APIs."""
 
+    # Refresh 60 s before actual expiry to avoid races
+    _TOKEN_EXPIRY_BUFFER = timedelta(seconds=60)
+
     def __init__(self, http_client: httpx.AsyncClient) -> None:
         self._client = http_client
         self._token: str | None = None
+        self._token_expires_at: datetime | None = None
+
+    def _is_token_valid(self) -> bool:
+        """Return True if a non-expired token is cached."""
+        if not self._token or self._token_expires_at is None:
+            return False
+        return datetime.now(tz=timezone.utc) < (
+            self._token_expires_at - self._TOKEN_EXPIRY_BUFFER
+        )
 
     # ── Authentication ────────────────────────────────────────────────
 
@@ -92,17 +105,36 @@ class HCSClient:
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise SourceAPITimeoutException(
-                details={"endpoint": url, "error": str(exc)}
+                message="IAM authentication request timed out.",
+                details={"endpoint": url, "error": str(exc)},
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise SourceAPIConnectionException(
+                details={"endpoint": url, "error": str(exc)},
             ) from exc
         except httpx.HTTPStatusError as exc:
-            raise AuthenticationException(
-                message=f"IAM authentication failed (HTTP {exc.response.status_code}).",
-                details={"url": url, "body": exc.response.text[:500]},
+            status = exc.response.status_code
+            body = exc.response.text[:500]
+            # 4xx credential/auth errors → AuthenticationException (401 to client)
+            if status in (401, 403):
+                raise AuthenticationException(
+                    message=f"IAM authentication rejected (HTTP {status}).",
+                    details={"url": url, "body": body},
+                ) from exc
+            # 504 / upstream gateway timeout → SourceAPITimeoutException
+            if status == 504:
+                raise SourceAPITimeoutException(
+                    message="IAM gateway timed out (504). Check network path to IAM.",
+                    details={"url": url, "body": body},
+                ) from exc
+            # Any other non-2xx (5xx, etc.) → SourceAPIException (502 to client)
+            raise SourceAPIException(
+                message=f"IAM endpoint returned HTTP {status}.",
+                details={"url": url, "status_code": status, "body": body},
             ) from exc
         except httpx.HTTPError as exc:
-            raise AuthenticationException(
-                message="IAM authentication request failed.",
-                details={"url": url, "error": str(exc)},
+            raise SourceAPIConnectionException(
+                details={"endpoint": url, "error": str(exc)},
             ) from exc
 
         token = response.headers.get("X-Subject-Token", "")
@@ -112,7 +144,29 @@ class HCSClient:
             )
 
         self._token = token
-        logger.info("HCS IAM authentication successful.")
+
+        # Parse expiry and user info from the response body
+        try:
+            body_data = response.json()
+            token_data = body_data.get("token", {})
+            expires_at_str = token_data.get("expires_at", "")
+            if expires_at_str:
+                self._token_expires_at = datetime.fromisoformat(
+                    expires_at_str.replace("Z", "+00:00")
+                )
+            user = token_data.get("user", {})
+            logger.info(
+                "HCS IAM authentication successful",
+                extra={
+                    "iam_user": user.get("name", ""),
+                    "iam_domain": user.get("domain", {}).get("name", ""),
+                    "token_expires_at": expires_at_str,
+                },
+            )
+        except Exception:
+            # Non-fatal — token itself is valid even if body parsing fails
+            logger.warning("Could not parse IAM token response body.")
+
         return token
 
     # ── Regions ───────────────────────────────────────────────────────
@@ -126,7 +180,7 @@ class HCSClient:
         Returns:
             List of HCSRegion objects (use .id as region_code).
         """
-        if not self._token:
+        if not self._is_token_valid():
             await self.authenticate()
 
         assert self._token is not None
@@ -156,6 +210,7 @@ class HCSClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 401:
                 self._token = None
+                self._token_expires_at = None
             raise SourceAPIException(
                 message=f"SC API returned {exc.response.status_code} fetching regions.",
                 details={"endpoint": url, "body": exc.response.text[:500]},
@@ -201,7 +256,7 @@ class HCSClient:
         Returns:
             List of HCSVDC objects (use .domain_id as the tenant ID for metrics).
         """
-        if not self._token:
+        if not self._is_token_valid():
             await self.authenticate()
 
         assert self._token is not None
@@ -245,6 +300,7 @@ class HCSClient:
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 401:
                     self._token = None
+                    self._token_expires_at = None
                 raise SourceAPIException(
                     message=f"SC API returned {exc.response.status_code} fetching VDCs.",
                     details={"endpoint": base_url,
@@ -306,7 +362,7 @@ class HCSClient:
         Returns:
             List of validated HCSMetricRecord objects.
         """
-        if not self._token:
+        if not self._is_token_valid():
             await self.authenticate()
 
         assert self._token is not None
@@ -365,6 +421,7 @@ class HCSClient:
                 # If 401, token may have expired — clear it for retry
                 if exc.response.status_code == 401:
                     self._token = None
+                    self._token_expires_at = None
                 raise SourceAPIException(
                     message=f"SC API returned {exc.response.status_code}.",
                     details={
