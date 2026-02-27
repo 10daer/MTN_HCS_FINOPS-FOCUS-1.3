@@ -2,7 +2,7 @@
 Transform endpoint — trigger HCS fetch + FOCUS transform pipeline.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_transform_service
 from app.schemas.focus_schema import FocusResponse
@@ -32,10 +32,6 @@ async def transform_data(
         start_time=req.start_time,
         end_time=req.end_time,
         resource_type_code=req.resource_type_code,
-        period=req.period,
-        time_zone=req.time_zone,
-        locale=req.locale,
-        limit=req.limit,
         tenant_name=req.tenant_name,
         tenant_id=req.tenant_id,
         vdc_name=req.vdc_name,

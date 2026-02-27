@@ -40,6 +40,8 @@ _METRICS_ENDPOINT = "/rest/metering/v3.0/query-metrics-data"
 _REGIONS_ENDPOINT = "/silvan/rest/v1.0/regions"
 _VDCS_ENDPOINT = "/rest/vdc/v3.0/vdcs"
 
+_LOGIN_REDIRECT_MARKER = "authui/login"
+
 
 # ── curl response container ───────────────────────────────────────────
 
@@ -88,8 +90,9 @@ def _run_curl(
         cmd += ["--header", f"{key}: {value}"]
 
     if body is not None:
-        cmd += ["--header", "Content-Type: application/json",
-                "--data", json.dumps(body)]
+        if not headers or "Content-Type" not in headers:
+            cmd += ["--header", "Content-Type: application/json"]
+        cmd += ["--data", json.dumps(body)]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -173,6 +176,23 @@ class HCSClient:
     def _invalidate_token(self) -> None:
         self._token = None
         self._token_expires_at = None
+
+    def _sc_headers(self) -> dict[str, str]:
+        """Standard headers for SC Northbound API calls."""
+        assert self._token is not None
+        return {
+            "X-Auth-Token": self._token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    @staticmethod
+    def _is_login_redirect(response: _CurlResponse) -> bool:
+        """Detect HTML login-redirect pages the gateway returns for unauthed requests."""
+        return (
+            _LOGIN_REDIRECT_MARKER in response.text
+            or response.text.lstrip().startswith("<")
+        )
 
     # ── Authentication ────────────────────────────────────────────────
 
@@ -278,12 +298,24 @@ class HCSClient:
 
         response = await asyncio.to_thread(
             _run_curl, "GET", url,
-            headers={"X-Auth-Token": self._token},
+            headers=self._sc_headers(),
             timeout=settings.sc_api_timeout,
         )
 
-        if response.status_code == 401:
+        if response.status_code == 401 or self._is_login_redirect(response):
             self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "GET", url,
+                headers=self._sc_headers(),
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth. Token not accepted.",
+                details={"endpoint": url, "raw_body": response.text[:500]},
+            )
         if response.status_code != 200:
             raise SourceAPIException(
                 message=f"SC API returned {response.status_code} fetching regions.",
@@ -340,12 +372,25 @@ class HCSClient:
 
             response = await asyncio.to_thread(
                 _run_curl, "GET", url,
-                headers={"X-Auth-Token": self._token},
+                headers=self._sc_headers(),
                 timeout=settings.sc_api_timeout,
             )
 
-            if response.status_code == 401:
+            if response.status_code == 401 or self._is_login_redirect(response):
                 self._invalidate_token()
+                await self.authenticate()
+                response = await asyncio.to_thread(
+                    _run_curl, "GET", url,
+                    headers=self._sc_headers(),
+                    timeout=settings.sc_api_timeout,
+                )
+
+            if self._is_login_redirect(response):
+                raise AuthenticationException(
+                    message="SC API returned login redirect after re-auth. Token not accepted.",
+                    details={"endpoint": base_url,
+                             "raw_body": response.text[:500]},
+                )
             if response.status_code != 200:
                 raise SourceAPIException(
                     message=f"SC API returned {response.status_code} fetching VDCs.",
@@ -378,11 +423,11 @@ class HCSClient:
         domain_id: str,
         start_time: str,
         end_time: str,
-        resource_type_code: str,
+        resource_type_code: str | None = None,
         period: str = "daily",
         time_zone: str = "Africa/Lagos",
         locale: str = "en_US",
-        limit: int = 1000,
+        limit: int | None = None,
     ) -> list[HCSMetricRecord]:
         """
         Query cloud service CDRs from the SC Northbound Interface, auto-paginating.
@@ -402,7 +447,7 @@ class HCSClient:
         start = 0
 
         while True:
-            body = {
+            body: dict[str, Any] = {
                 "region_code": region_code,
                 "start_time": start_time,
                 "end_time": end_time,
@@ -410,10 +455,12 @@ class HCSClient:
                 "period": period,
                 "locale": locale,
                 "domain_id": domain_id,
-                "resource_type_code": resource_type_code,
-                "limit": limit,
                 "start": start,
             }
+            if resource_type_code:
+                body["resource_type_code"] = resource_type_code
+            if limit is not None:
+                body["limit"] = limit
 
             logger.info(
                 "Fetching HCS metrics page",
@@ -428,13 +475,26 @@ class HCSClient:
 
             response = await asyncio.to_thread(
                 _run_curl, "POST", url,
-                headers={"X-Auth-Token": self._token},
+                headers=self._sc_headers(),
                 body=body,
                 timeout=settings.sc_api_timeout,
             )
 
-            if response.status_code == 401:
+            if response.status_code == 401 or self._is_login_redirect(response):
                 self._invalidate_token()
+                await self.authenticate()
+                response = await asyncio.to_thread(
+                    _run_curl, "POST", url,
+                    headers=self._sc_headers(),
+                    body=body,
+                    timeout=settings.sc_api_timeout,
+                )
+
+            if self._is_login_redirect(response):
+                raise AuthenticationException(
+                    message="SC API returned login redirect after re-auth. Token not accepted.",
+                    details={"endpoint": url, "raw_body": response.text[:500]},
+                )
             if response.status_code != 200:
                 raise SourceAPIException(
                     message=f"SC API returned {response.status_code}.",
@@ -470,7 +530,9 @@ class HCSClient:
 
             if len(all_records) >= total_reported or not metrics_response.metrics:
                 break
-            start += limit
+            # Default SC API page size is 20 when limit is not specified
+            start += limit if limit is not None else len(
+                metrics_response.metrics)
 
         logger.info(
             "HCS metrics fetch complete",

@@ -40,6 +40,8 @@ ENV/
 htmlcov/
 .coverage
 coverage.xml
+docs
+scripts
 
 # ===========================================
 # OS Files
