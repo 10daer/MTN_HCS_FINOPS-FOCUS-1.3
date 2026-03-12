@@ -14,7 +14,7 @@ import asyncio
 import json
 import subprocess
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlencode
 
 from app.config import get_settings
@@ -33,12 +33,22 @@ from app.schemas import (
     HCSVDC,
     HCSVDCsResponse,
 )
+from app.schemas.tag_schema import (
+    QueryResourceTagsResponse,
+    ListTagsResponse,
+    PreDefineTagsResponse,
+)
 
 logger = get_logger(__name__)
 
 _METRICS_ENDPOINT = "/rest/metering/v3.0/query-metrics-data"
 _REGIONS_ENDPOINT = "/silvan/rest/v1.0/regions"
 _VDCS_ENDPOINT = "/rest/vdc/v3.0/vdcs"
+
+_TAGS_RESOURCES_ACTION_ENDPOINT = "/rest/tag/v3.0/tags/resources/action"
+_TAGS_ENDPOINT = "/rest/tag/v3.0/tags"
+_TAGS_AUTHEN_ENDPOINT = "/rest/tag/v3.0/tags/authen"
+_PREDEFINE_TAGS_ENDPOINT = "/v1.0/predefine_tags"
 
 _LOGIN_REDIRECT_MARKER = "authui/login"
 
@@ -417,7 +427,7 @@ class HCSClient:
 
     # ── Metrics Query ─────────────────────────────────────────────────
 
-    async def fetch_metrics(
+    async def fetch_metrics_pages(
         self,
         region_code: str,
         domain_id: str,
@@ -428,11 +438,12 @@ class HCSClient:
         time_zone: str = "Africa/Lagos",
         locale: str = "en_US",
         limit: int | None = None,
-    ) -> list[HCSMetricRecord]:
+    ) -> AsyncIterator[list[HCSMetricRecord]]:
         """
-        Query cloud service CDRs from the SC Northbound Interface, auto-paginating.
+        Async generator that yields one page of HCS metric records at a time.
 
-        POST https://{SC_DOMAIN}/rest/metering/v3.0/query-metrics-data
+        Uses marker-based pagination: the loop continues until the API
+        returns an empty marker string.
         """
         if not self._is_token_valid():
             await self.authenticate()
@@ -442,9 +453,7 @@ class HCSClient:
         settings = get_settings()
         url = f"{settings.sc_domain}{_METRICS_ENDPOINT}"
 
-        all_records: list[HCSMetricRecord] = []
-        total_reported = 0
-        start = 0
+        marker: str | None = None  # None = first request; "" = done
 
         while True:
             body: dict[str, Any] = {
@@ -455,8 +464,9 @@ class HCSClient:
                 "period": period,
                 "locale": locale,
                 "domain_id": domain_id,
-                "start": start,
             }
+            if marker:
+                body["marker"] = marker
             if resource_type_code:
                 body["resource_type_code"] = resource_type_code
             if limit is not None:
@@ -468,7 +478,7 @@ class HCSClient:
                     "url": url,
                     "region": region_code,
                     "resource_type": resource_type_code,
-                    "start": start,
+                    "marker": marker,
                     "limit": limit,
                 },
             )
@@ -509,9 +519,9 @@ class HCSClient:
             if not response.text:
                 logger.warning(
                     "SC API returned 200 with empty body — treating as zero records",
-                    extra={"endpoint": url, "start": start},
+                    extra={"endpoint": url, "marker": marker},
                 )
-                break
+                return
 
             try:
                 metrics_response = HCSMetricsResponse(**response.json())
@@ -525,17 +535,349 @@ class HCSClient:
                     },
                 ) from exc
 
-            all_records.extend(metrics_response.metrics)
-            total_reported = metrics_response.total
+            if metrics_response.metrics:
+                yield metrics_response.metrics
 
-            if len(all_records) >= total_reported or not metrics_response.metrics:
-                break
-            # Default SC API page size is 20 when limit is not specified
-            start += limit if limit is not None else len(
-                metrics_response.metrics)
+            # Empty marker means no more pages
+            if not metrics_response.marker:
+                return
+
+            marker = metrics_response.marker
+
+    async def fetch_metrics(
+        self,
+        region_code: str,
+        domain_id: str,
+        start_time: str,
+        end_time: str,
+        resource_type_code: str | None = None,
+        period: str = "daily",
+        time_zone: str = "Africa/Lagos",
+        locale: str = "en_US",
+        limit: int | None = None,
+    ) -> list[HCSMetricRecord]:
+        """
+        Convenience wrapper: fetches ALL pages and returns a flat list.
+
+        For streaming use cases prefer ``fetch_metrics_pages()``.
+        """
+        all_records: list[HCSMetricRecord] = []
+        async for page in self.fetch_metrics_pages(
+            region_code=region_code,
+            domain_id=domain_id,
+            start_time=start_time,
+            end_time=end_time,
+            resource_type_code=resource_type_code,
+            period=period,
+            time_zone=time_zone,
+            locale=locale,
+            limit=limit,
+        ):
+            all_records.extend(page)
 
         logger.info(
             "HCS metrics fetch complete",
-            extra={"record_count": len(all_records), "total": total_reported},
+            extra={"record_count": len(all_records)},
         )
         return all_records
+
+    # ── Tags: Query resources associated with a tag (14.2) ────────────
+
+    async def query_resource_tags(self, body: dict) -> QueryResourceTagsResponse:
+        """
+        Query the list of resources bound to a tag.
+
+        POST https://{SC_DOMAIN}/rest/tag/v3.0/tags/resources/action
+        """
+        if not self._is_token_valid():
+            await self.authenticate()
+
+        settings = get_settings()
+        url = f"{settings.sc_domain}{_TAGS_RESOURCES_ACTION_ENDPOINT}"
+
+        logger.info("Querying resource tags", extra={"url": url, "action": body.get("action")})
+
+        response = await asyncio.to_thread(
+            _run_curl, "POST", url,
+            headers=self._sc_headers(),
+            body=body,
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401 or self._is_login_redirect(response):
+            self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "POST", url,
+                headers=self._sc_headers(),
+                body=body,
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth.",
+                details={"endpoint": url, "raw_body": response.text[:500]},
+            )
+        if response.status_code != 200:
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} querying resource tags.",
+                details={"endpoint": url, "body": response.text[:500]},
+            )
+
+        try:
+            result = QueryResourceTagsResponse(**response.json())
+        except Exception as exc:
+            raise SourceAPIException(
+                message="Failed to parse resource tags response.",
+                details={"endpoint": url, "error": str(exc)},
+            ) from exc
+
+        logger.info("Resource tags queried", extra={"total": result.total})
+        return result
+
+    # ── Tags: Query predefined tags — new (14.3) ──────────────────────
+
+    async def fetch_predefined_tags(
+        self,
+        key: str | None = None,
+        value: str | None = None,
+        limit: int | None = None,
+        marker: str | None = None,
+        order_field: str | None = None,
+        order_method: str | None = None,
+    ) -> PreDefineTagsResponse:
+        """
+        Query predefined tags (new).
+
+        GET https://{SC_DOMAIN}/v1.0/predefine_tags
+        """
+        if not self._is_token_valid():
+            await self.authenticate()
+
+        settings = get_settings()
+        params: dict[str, Any] = {}
+        if key is not None:
+            params["key"] = key
+        if value is not None:
+            params["value"] = value
+        if limit is not None:
+            params["limit"] = limit
+        if marker is not None:
+            params["marker"] = marker
+        if order_field is not None:
+            params["order_field"] = order_field
+        if order_method is not None:
+            params["order_method"] = order_method
+
+        base_url = f"{settings.sc_domain}{_PREDEFINE_TAGS_ENDPOINT}"
+        url = f"{base_url}?{urlencode(params)}" if params else base_url
+
+        logger.info("Fetching predefined tags (new)", extra={"url": base_url})
+
+        response = await asyncio.to_thread(
+            _run_curl, "GET", url,
+            headers=self._sc_headers(),
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401 or self._is_login_redirect(response):
+            self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "GET", url,
+                headers=self._sc_headers(),
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth.",
+                details={"endpoint": base_url, "raw_body": response.text[:500]},
+            )
+        if response.status_code != 200:
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} fetching predefined tags.",
+                details={"endpoint": base_url, "body": response.text[:500]},
+            )
+
+        try:
+            result = PreDefineTagsResponse(**response.json())
+        except Exception as exc:
+            raise SourceAPIException(
+                message="Failed to parse predefined tags response.",
+                details={"endpoint": base_url, "error": str(exc)},
+            ) from exc
+
+        logger.info("Predefined tags fetched", extra={"total": result.total_count})
+        return result
+
+    # ── Tags: Query list of tags (14.5) ───────────────────────────────
+
+    async def fetch_tags(
+        self,
+        key: str | None = None,
+        value: str | None = None,
+        start: str | None = None,
+        limit: str | None = None,
+        order_field: str | None = None,
+        order_method: str | None = None,
+    ) -> ListTagsResponse:
+        """
+        Query the tag list with optional filtering, pagination, and sorting.
+
+        GET https://{SC_DOMAIN}/rest/tag/v3.0/tags
+        """
+        if not self._is_token_valid():
+            await self.authenticate()
+
+        settings = get_settings()
+        params: dict[str, Any] = {}
+        if key is not None:
+            params["key"] = key
+        if value is not None:
+            params["value"] = value
+        if start is not None:
+            params["start"] = start
+        if limit is not None:
+            params["limit"] = limit
+        if order_field is not None:
+            params["order_field"] = order_field
+        if order_method is not None:
+            params["order_method"] = order_method
+
+        base_url = f"{settings.sc_domain}{_TAGS_ENDPOINT}"
+        url = f"{base_url}?{urlencode(params)}" if params else base_url
+
+        logger.info("Fetching tags list", extra={"url": base_url})
+
+        response = await asyncio.to_thread(
+            _run_curl, "GET", url,
+            headers=self._sc_headers(),
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401 or self._is_login_redirect(response):
+            self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "GET", url,
+                headers=self._sc_headers(),
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth.",
+                details={"endpoint": base_url, "raw_body": response.text[:500]},
+            )
+        if response.status_code != 200:
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} fetching tags.",
+                details={"endpoint": base_url, "body": response.text[:500]},
+            )
+
+        try:
+            result = ListTagsResponse(**response.json())
+        except Exception as exc:
+            raise SourceAPIException(
+                message="Failed to parse tags response.",
+                details={"endpoint": base_url, "error": str(exc)},
+            ) from exc
+
+        logger.info("Tags list fetched", extra={"total": result.total})
+        return result
+
+    # ── Tags: Create or delete in batches (14.6) ──────────────────────
+
+    async def batch_create_delete_tags(self, action: str, tags: list[dict]) -> None:
+        """
+        Create or delete tags in batches.
+
+        POST https://{SC_DOMAIN}/rest/tag/v3.0/tags
+        """
+        if not self._is_token_valid():
+            await self.authenticate()
+
+        settings = get_settings()
+        url = f"{settings.sc_domain}{_TAGS_ENDPOINT}"
+
+        body = {"action": action, "tags": tags}
+
+        logger.info("Batch tag operation", extra={"url": url, "action": action})
+
+        response = await asyncio.to_thread(
+            _run_curl, "POST", url,
+            headers=self._sc_headers(),
+            body=body,
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401 or self._is_login_redirect(response):
+            self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "POST", url,
+                headers=self._sc_headers(),
+                body=body,
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth.",
+                details={"endpoint": url, "raw_body": response.text[:500]},
+            )
+        if response.status_code not in (200, 204):
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} in batch tag operation.",
+                details={"endpoint": url, "body": response.text[:500]},
+            )
+
+        logger.info("Batch tag operation succeeded", extra={"action": action})
+
+    # ── Tags: Verify permissions (14.7) ───────────────────────────────
+
+    async def verify_tag_permissions(self, body: dict) -> None:
+        """
+        Verify permissions on resources before tag association/disassociation.
+
+        POST https://{SC_DOMAIN}/rest/tag/v3.0/tags/authen
+        """
+        if not self._is_token_valid():
+            await self.authenticate()
+
+        settings = get_settings()
+        url = f"{settings.sc_domain}{_TAGS_AUTHEN_ENDPOINT}"
+
+        logger.info("Verifying tag permissions", extra={"url": url})
+
+        response = await asyncio.to_thread(
+            _run_curl, "POST", url,
+            headers=self._sc_headers(),
+            body=body,
+            timeout=settings.sc_api_timeout,
+        )
+
+        if response.status_code == 401 or self._is_login_redirect(response):
+            self._invalidate_token()
+            await self.authenticate()
+            response = await asyncio.to_thread(
+                _run_curl, "POST", url,
+                headers=self._sc_headers(),
+                body=body,
+                timeout=settings.sc_api_timeout,
+            )
+
+        if self._is_login_redirect(response):
+            raise AuthenticationException(
+                message="SC API returned login redirect after re-auth.",
+                details={"endpoint": url, "raw_body": response.text[:500]},
+            )
+        if response.status_code != 200:
+            raise SourceAPIException(
+                message=f"SC API returned {response.status_code} verifying tag permissions.",
+                details={"endpoint": url, "body": response.text[:500]},
+            )
+
+        logger.info("Tag permissions verified successfully")
