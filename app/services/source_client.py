@@ -25,6 +25,7 @@ from app.core.exceptions import (
     SourceAPITimeoutException,
 )
 from app.core.logging import get_logger
+from app.utils.helpers import save_api_response
 from app.schemas import (
     HCSMetricRecord,
     HCSMetricsResponse,
@@ -579,6 +580,31 @@ class HCSClient:
             "HCS metrics fetch complete",
             extra={"record_count": len(all_records)},
         )
+
+        saved_path = save_api_response(
+            method="POST",
+            url=f"{get_settings().sc_domain}{_METRICS_ENDPOINT}",
+            status_code=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "region_code": region_code,
+                    "domain_id": domain_id,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "resource_type_code": resource_type_code,
+                    "period": period,
+                    "time_zone": time_zone,
+                    "locale": locale,
+                    "limit": limit,
+                    "record_count": len(all_records),
+                    "records": [record.model_dump() for record in all_records],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        logger.debug("Saved metrics API response", extra={"file_path": str(saved_path)})
+
         return all_records
 
     # ── Tags: Query resources associated with a tag (14.2) ────────────
